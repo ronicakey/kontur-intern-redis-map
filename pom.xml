@@ -8,6 +8,13 @@
     <artifactId>redis-map</artifactId>
     <version>1.0.0</version>
 
+    <developers>
+        <developer>
+            <id>rnkey</id>
+            <name>Veronica Kazarina</name>
+        </developer>
+    </developers>
+
     <build>
         <plugins>
             <plugin>
@@ -35,4 +42,5 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
 </project>
