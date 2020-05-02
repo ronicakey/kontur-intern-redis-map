@@ -1,23 +1,30 @@
 package ru.gnkoshelev.kontur.intern.redis.map;
 
 import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Response;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.ScanParams;
 import redis.clients.jedis.ScanResult;
 import redis.clients.jedis.Transaction;
 
+import java.time.Duration;
 import java.util.AbstractCollection;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -59,12 +66,12 @@ public class RedisMap implements Map<String, String> {
     * Since Redis does not store nulls, String tokens are used instead.
     *
     * To overcome the inability of Redis to store empty objects, every RedisMap
-    * instance contains an "empty entry", that has no other effect on map operations
+    * instance contains an "empty entry", that has no effect on map operations
     * other than to make it visible in Redis even when it has no actual entries.
     *
-    * Redis automatically disposes of the keys that have been idle for longer
-    * than the set "time to live". The timer is reset by any interaction with a
-    * Redis object, including non-modifying operations, such as iteration and retrieval.
+    * Lifetime of linked Redis hash objects is controlled through their "time to live"
+    * that is reset to default value at fixed intervals. Redis automatically disposes
+    * of the hashes when their associated RedisMap objects are no longer accessible.
     *
     * All iterators are based on RedisIterator class that uses HSCAN command
     * to iterate over hash keys. The implementation was tested on RedisMap objects
@@ -136,15 +143,80 @@ public class RedisMap implements Map<String, String> {
      */
     private static final int SCAN_COUNT = 100;
 
+    /**
+     * Connection pool.
+     */
+    private static final JedisPool POOL;
+
+    //pool configuration parameters
+
+    /**
+     * The upper bound of connections managed by the pool.
+     */
+    //the set value assumes that the number of RedisMap instances equals 10
+    private static final int MAX_TOTAL = 100;
+
+    /**
+     * The upper bound of connections that can be idle
+     * without being immediately closed.
+     */
+    private static final int MAX_IDLE = MAX_TOTAL;
+
+    /**
+     * The minimum number of idle connections to maintain in the pool.
+     */
+    //each RedisMap instance needs at least 1 connection to update its expiration time
+    private static final int MIN_IDLE = 10;
+
+    /**
+     * The parameter that determines whether connections are tested
+     * before they are borrowed from the pool.
+     */
+    private static final boolean TEST_ON_BORROW = true;
+
+    /**
+     * The parameter that determines whether connections are tested
+     * before they are returned to the pool.
+     */
+    private static final boolean TEST_ON_RETURN = true;
+
+    /**
+     * The parameter that determines whether to block threads
+     * when no connections are available.
+     */
+    private static final boolean BLOCK_WHEN_EXHAUSTED = true;
+
+    /**
+     * The maximum amount of time (in milliseconds) threads should be blocked
+     * before throwing an exception when the pool is exhausted.
+     * If set to -1, waits indefinitely.
+     * Should be strictly less than KEY_TTL value to prevent Redis hash object
+     * removal due to delayed expiration time update.
+     */
+    private static final int MAX_WAIT = 5;
+
+    /**
+     * The minimum amount of time a connection may remain idle
+     * before it is eligible for eviction if MIN_IDLE instances are available.
+     */
+    private static final int SOFT_IDLE_TIME = 30;
+
+    /**
+     * The delay used by RedisMap instance's scheduler.
+     */
+    private static final int UPDATE_INTERVAL = KEY_TTL - MAX_WAIT;
+
     /* ---------------- Fields -------------- */
+
+    /**
+     * Service used to update Redis hash expiration time.
+     */
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     /**
      * The key of the Redis hash object this map is linked to.
      */
     private final String redisKey;
-
-    // One connection per RedisMap instance.
-    private final Jedis jedis;
 
     //views
     private transient Set<String> keySet;
@@ -153,8 +225,17 @@ public class RedisMap implements Map<String, String> {
 
     /* ---------------- Public operations -------------- */
 
-    {
-        jedis = new Jedis();
+    static {
+        JedisPoolConfig config = new JedisPoolConfig();
+        config.setMaxTotal(MAX_TOTAL);
+        config.setMaxIdle(MAX_IDLE);
+        config.setMinIdle(MIN_IDLE);
+        config.setBlockWhenExhausted(BLOCK_WHEN_EXHAUSTED);
+        config.setMaxWaitMillis(Duration.ofSeconds(MAX_WAIT).toMillis());
+        config.setTestOnBorrow(TEST_ON_BORROW);
+        config.setTestOnReturn(TEST_ON_RETURN);
+        config.setSoftMinEvictableIdleTimeMillis(SOFT_IDLE_TIME);
+        POOL = new JedisPool(config);
     }
 
     /**
@@ -163,6 +244,7 @@ public class RedisMap implements Map<String, String> {
     public RedisMap() {
         redisKey = generateKey();
         initialize();
+        setScheduler();
     }
 
     /**
@@ -177,6 +259,7 @@ public class RedisMap implements Map<String, String> {
     public RedisMap(long id) {
         redisKey = validateKey(id);
         initialize();
+        setScheduler();
     }
 
     /**
@@ -193,16 +276,26 @@ public class RedisMap implements Map<String, String> {
     public RedisMap(String key) {
         redisKey = validateKey(key);
         initialize();
+        setScheduler();
     }
 
     /**
      * Makes an empty {@code RedisMap} visible in Redis.
      */
     private void initialize() {
-        Transaction transaction = jedis.multi();
-        transaction.hset(redisKey, EMPTY_FIELD_TOKEN, EMPTY_FIELD_TOKEN);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
+        try (Jedis jedis = POOL.getResource()) {
+            jedis.hset(redisKey, EMPTY_FIELD_TOKEN, EMPTY_FIELD_TOKEN);
+        }
+    }
+
+    /**
+     * Sets the scheduler to update Redis hash expiration time at regular intervals.
+     */
+    private void setScheduler() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            try (Jedis jedis = POOL.getResource()) {
+                jedis.expire(redisKey, KEY_TTL);
+            }}, 0, UPDATE_INTERVAL, TimeUnit.SECONDS);
     }
 
     /**
@@ -228,11 +321,9 @@ public class RedisMap implements Map<String, String> {
      * Assumes that the "empty entry" is in place.
      */
     private long getHashSize() {
-        Transaction transaction = jedis.multi();
-        Response<Long> size = transaction.hlen(redisKey);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
-        return Math.max(size.get() - 1, 0);
+        try (Jedis jedis = POOL.getResource()) {
+            return Math.max(jedis.hlen(redisKey) - 1, 0);
+        }
     }
 
     /**
@@ -254,11 +345,9 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.containsKey and related methods.
      */
     private boolean containsHashKey(String key) {
-        Transaction transaction = jedis.multi();
-        Response<Boolean> keyExists = transaction.hexists(redisKey, key);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
-        return keyExists.get();
+        try (Jedis jedis = POOL.getResource()) {
+            return jedis.hexists(redisKey, key);
+        }
     }
 
     /**
@@ -317,13 +406,10 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.get and related methods.
      */
     private Entry<String, String> getHashField(String key) {
-        Transaction transaction = jedis.multi();
-        Response<String> output = transaction.hget(redisKey, key);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
-        String value;
-        return (value = output.get()) == null ? null :
-                new AbstractMap.SimpleEntry<>(key, value);
+        try (Jedis jedis = POOL.getResource()) {
+            String value = jedis.hget(redisKey, key);
+            return value == null ? null : new AbstractMap.SimpleEntry<>(key, value);
+        }
     }
 
     /**
@@ -348,20 +434,21 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.put and related methods.
      */
     private String setField(String key, String value, boolean onlyIfAbsent) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (!onlyIfAbsent || (output == null || NULL_TOKEN.equals(output))) {
-                Transaction transaction = jedis.multi();
-                transaction.hset(redisKey, key, value);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (!onlyIfAbsent || (output == null || NULL_TOKEN.equals(output))) {
+                    Transaction transaction = jedis.multi();
+                    transaction.hset(redisKey, key, value);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
                 }
+                jedis.unwatch();
+                return output;
             }
-            jedis.unwatch();
-            return output;
         }
     }
 
@@ -388,23 +475,24 @@ public class RedisMap implements Map<String, String> {
      * Attempts to atomize remove operation.
      */
     private Entry<String, String> removeField(String key, String value) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (output != null) {
-                if (value == null || output.equals(value)) {
-                    Transaction transaction = jedis.multi();
-                    transaction.hdel(redisKey, key);
-                    List<Object> results = transaction.exec();
-                    if (results == null) {
-                        continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (output != null) {
+                    if (value == null || output.equals(value)) {
+                        Transaction transaction = jedis.multi();
+                        transaction.hdel(redisKey, key);
+                        List<Object> results = transaction.exec();
+                        if (results == null) {
+                            continue;
+                        }
+                        return new AbstractMap.SimpleEntry<>(key, output);
                     }
-                    return new AbstractMap.SimpleEntry<>(key, output);
                 }
+                jedis.unwatch();
+                return null;
             }
-            jedis.unwatch();
-            return null;
         }
     }
 
@@ -433,10 +521,9 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.putAll.
      */
     private void setAllFields(Map<String, String> map) {
-        Transaction transaction = jedis.multi();
-        transaction.hset(redisKey, map);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
+        try (Jedis jedis = POOL.getResource()) {
+            jedis.hset(redisKey, map);
+        }
     }
 
     /**
@@ -452,11 +539,13 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.clear and related methods.
      */
     private void clearHash() {
-        Transaction transaction = jedis.multi();
-        transaction.unlink(redisKey);
-        transaction.hset(redisKey, EMPTY_FIELD_TOKEN, EMPTY_FIELD_TOKEN);
-        transaction.expire(redisKey, KEY_TTL);
-        transaction.exec();
+        try (Jedis jedis = POOL.getResource()) {
+            Transaction transaction = jedis.multi();
+            transaction.unlink(redisKey);
+            transaction.hset(redisKey, EMPTY_FIELD_TOKEN, EMPTY_FIELD_TOKEN);
+            transaction.expire(redisKey, KEY_TTL);
+            transaction.exec();
+        }
     }
 
     /**
@@ -505,6 +594,28 @@ public class RedisMap implements Map<String, String> {
             }
             return false;
         }
+
+        public final boolean removeAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, false));
+        }
+
+        public final boolean retainAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, true));
+        }
+
+        private List<String> getKeyList(Collection<?> collection, boolean retain) {
+            Iterator<String> iterator = iterator();
+            List<String> keyList = new ArrayList<>(size());
+            String key;
+            while (iterator.hasNext()) {
+                if (retain ^ collection.contains(key = iterator.next())) {
+                    keyList.add((String) nullToToken(key));
+                }
+            }
+            return keyList;
+        }
     }
 
     /**
@@ -545,6 +656,28 @@ public class RedisMap implements Map<String, String> {
         public final boolean contains(Object value) {
             return RedisMap.this.containsValue(value);
         }
+
+        public final boolean removeAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, false));
+        }
+
+        public final boolean retainAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, true));
+        }
+
+        private List<String> getKeyList(Collection<?> collection, boolean retain) {
+            Iterator<String> iterator = iterator();
+            List<String> keyList = new ArrayList<>(size());
+            while (iterator.hasNext()) {
+                if (retain ^ collection.contains(iterator.next())) {
+                    keyList.add((String) nullToToken(((ValueIterator)iterator).getCurrentKey()));
+                }
+            }
+            return keyList;
+        }
+
     }
 
     /**
@@ -608,6 +741,48 @@ public class RedisMap implements Map<String, String> {
                 }
             }
             return false;
+        }
+
+        public final boolean removeAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, false));
+        }
+
+        public final boolean retainAll(Collection<?> collection) {
+            Objects.requireNonNull(collection);
+            return RedisMap.this.removeAll(getKeyList(collection, true));
+        }
+
+        private List<String> getKeyList(Collection<?> collection, boolean retain) {
+            Iterator<Entry<String, String>> iterator = iterator();
+            List<String> keyList = new ArrayList<>(size());
+            Entry<String, String> entry;
+            while (iterator.hasNext()) {
+                if (retain ^ collection.contains(entry = iterator.next())) {
+                    keyList.add((String) nullToToken(entry.getKey()));
+                }
+            }
+            return keyList;
+        }
+    }
+
+    /**
+     * Used by the views' removeAll and retainAll methods.
+     */
+    private boolean removeAll(List<String> keyList) {
+        if (keyList.isEmpty()) {
+            return false;
+        }
+        String[] keyArray = new String[keyList.size()];
+        return removeAllFields(keyList.toArray(keyArray)) != 0;
+    }
+
+    /**
+     * Implements removeAll method.
+     */
+    private long removeAllFields(String[] keys) {
+        try (Jedis jedis = POOL.getResource()) {
+            return jedis.hdel(redisKey, keys);
         }
     }
 
@@ -753,23 +928,24 @@ public class RedisMap implements Map<String, String> {
      */
     private void replaceFieldValue(String key,
                                    BiFunction<? super String, ? super String, ? extends String> function) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (output != null) {
-                String value = function.apply(key, tokenToNull(output));
-                value = (String) nullToToken(value);
-                Transaction transaction = jedis.multi();
-                transaction.hset(redisKey, key, value);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (output != null) {
+                    String value = function.apply(key, tokenToNull(output));
+                    value = (String) nullToToken(value);
+                    Transaction transaction = jedis.multi();
+                    transaction.hset(redisKey, key, value);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
+                    return;
                 }
+                jedis.unwatch();
                 return;
             }
-            jedis.unwatch();
-            return;
         }
     }
 
@@ -793,23 +969,24 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.replace methods.
      */
     private Entry<String, String> replaceFieldValue(String key, String oldValue, String newValue) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (output != null) {
-                if (oldValue == null || output.equals(oldValue)) {
-                    Transaction transaction = jedis.multi();
-                    transaction.hset(redisKey, key, newValue);
-                    List<Object> results = transaction.exec();
-                    if (results == null) {
-                        continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (output != null) {
+                    if (oldValue == null || output.equals(oldValue)) {
+                        Transaction transaction = jedis.multi();
+                        transaction.hset(redisKey, key, newValue);
+                        List<Object> results = transaction.exec();
+                        if (results == null) {
+                            continue;
+                        }
+                        return new AbstractMap.SimpleEntry<>(key, output);
                     }
-                    return new AbstractMap.SimpleEntry<>(key, output);
                 }
+                jedis.unwatch();
+                return null;
             }
-            jedis.unwatch();
-            return null;
         }
     }
 
@@ -846,23 +1023,24 @@ public class RedisMap implements Map<String, String> {
      * Implements RedisMap.computeIfAbsent.
      */
     private String resetFieldIfAbsent(String key, String value) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (value != null)  {
-                if (output == null || NULL_TOKEN.equals(output)) {
-                    Transaction transaction = jedis.multi();
-                    transaction.hset(redisKey, key, value);
-                    List<Object> results = transaction.exec();
-                    if (results == null) {
-                        continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (value != null)  {
+                    if (output == null || NULL_TOKEN.equals(output)) {
+                        Transaction transaction = jedis.multi();
+                        transaction.hset(redisKey, key, value);
+                        List<Object> results = transaction.exec();
+                        if (results == null) {
+                            continue;
+                        }
+                        return value;
                     }
-                    return value;
                 }
+                jedis.unwatch();
+                return output;
             }
-            jedis.unwatch();
-            return output;
         }
     }
 
@@ -882,31 +1060,32 @@ public class RedisMap implements Map<String, String> {
      */
     private String resetFieldIfPresent(String key,
                                        BiFunction<? super String, ? super String, ? extends String> remappingFunction) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            if (output != null && !NULL_TOKEN.equals(output)) {
-                String value = remappingFunction.apply(key, output);
-                if (value != null) {
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                if (output != null && !NULL_TOKEN.equals(output)) {
+                    String value = remappingFunction.apply(key, output);
+                    if (value != null) {
+                        Transaction transaction = jedis.multi();
+                        transaction.hset(redisKey, key, value);
+                        List<Object> results = transaction.exec();
+                        if (results == null) {
+                            continue;
+                        }
+                        return value;
+                    }
                     Transaction transaction = jedis.multi();
-                    transaction.hset(redisKey, key, value);
+                    transaction.hdel(redisKey, key);
                     List<Object> results = transaction.exec();
                     if (results == null) {
                         continue;
                     }
-                    return value;
+                    return null;
                 }
-                Transaction transaction = jedis.multi();
-                transaction.hdel(redisKey, key);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
-                }
-                return null;
+                jedis.unwatch();
+                return output;
             }
-            jedis.unwatch();
-            return output;
         }
     }
 
@@ -925,31 +1104,32 @@ public class RedisMap implements Map<String, String> {
      */
     private String resetField(String key,
                               BiFunction<? super String, ? super String, ? extends String> remappingFunction) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            String value = remappingFunction.apply(key, tokenToNull(output));
-            if (value != null) {
-                Transaction transaction = jedis.multi();
-                transaction.hset(redisKey, key, value);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                String value = remappingFunction.apply(key, tokenToNull(output));
+                if (value != null) {
+                    Transaction transaction = jedis.multi();
+                    transaction.hset(redisKey, key, value);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
+                    return value;
                 }
-                return value;
-            }
-            if (output != null) {
-                Transaction transaction = jedis.multi();
-                transaction.hdel(redisKey, key);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
+                if (output != null) {
+                    Transaction transaction = jedis.multi();
+                    transaction.hdel(redisKey, key);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
+                    return null;
                 }
+                jedis.unwatch();
                 return null;
             }
-            jedis.unwatch();
-            return null;
         }
     }
 
@@ -968,32 +1148,33 @@ public class RedisMap implements Map<String, String> {
      */
     private String mergeField(String key, String value,
                               BiFunction<? super String, ? super String, ? extends String> remappingFunction) {
-        while (true) {
-            jedis.expire(redisKey, KEY_TTL);
-            jedis.watch(redisKey);
-            String output = jedis.hget(redisKey, key);
-            String newValue;
-            if (output == null || NULL_TOKEN.equals(output)) {
-                newValue = value;
-            } else {
-                newValue = remappingFunction.apply(output, value);
-            }
-            if (newValue != null) {
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(redisKey);
+                String output = jedis.hget(redisKey, key);
+                String newValue;
+                if (output == null || NULL_TOKEN.equals(output)) {
+                    newValue = value;
+                } else {
+                    newValue = remappingFunction.apply(output, value);
+                }
+                if (newValue != null) {
+                    Transaction transaction = jedis.multi();
+                    transaction.hset(redisKey, key, newValue);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
+                    return newValue;
+                }
                 Transaction transaction = jedis.multi();
-                transaction.hset(redisKey, key, newValue);
+                transaction.hdel(redisKey, key);
                 List<Object> results = transaction.exec();
                 if (results == null) {
                     continue;
                 }
-                return newValue;
+                return null;
             }
-            Transaction transaction = jedis.multi();
-            transaction.hdel(redisKey, key);
-            List<Object> results = transaction.exec();
-            if (results == null) {
-                continue;
-            }
-            return null;
         }
     }
 
@@ -1012,33 +1193,37 @@ public class RedisMap implements Map<String, String> {
     private String generateKey() {
         long id;
         String key;
-        while (true) {
-            if ((id = jedis.incr(OBJECT_COUNTER)) > MAX_COUNT) { //atomic
-                resetCounter();
-                continue;
-            }
-            if (!jedis.exists(key = assembleKey(id))) { //maps initialized with user-defined id/key
-                jedis.expire(OBJECT_COUNTER, COUNTER_TTL);
-                return key;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                if ((id = jedis.incr(OBJECT_COUNTER)) > MAX_COUNT) { //atomic
+                    resetCounter();
+                    continue;
+                }
+                if (!jedis.exists(key = assembleKey(id))) { //maps initialized with user-defined id/key
+                    jedis.expire(OBJECT_COUNTER, COUNTER_TTL);
+                    return key;
+                }
             }
         }
     }
 
     // Prevents multiple deletions by different threads
     private void resetCounter() {
-        while (true) {
-            jedis.watch(OBJECT_COUNTER);
-            long counter = Long.parseLong(jedis.get(OBJECT_COUNTER));
-            if (counter > MAX_COUNT) {
-                Transaction transaction = jedis.multi();
-                transaction.del(OBJECT_COUNTER);
-                List<Object> results = transaction.exec();
-                if (results == null) {
-                    continue;
+        try (Jedis jedis = POOL.getResource()) {
+            while (true) {
+                jedis.watch(OBJECT_COUNTER);
+                long counter = Long.parseLong(jedis.get(OBJECT_COUNTER));
+                if (counter > MAX_COUNT) {
+                    Transaction transaction = jedis.multi();
+                    transaction.del(OBJECT_COUNTER);
+                    List<Object> results = transaction.exec();
+                    if (results == null) {
+                        continue;
+                    }
                 }
+                jedis.unwatch();
+                return;
             }
-            jedis.unwatch();
-            return;
         }
     }
 
@@ -1079,8 +1264,10 @@ public class RedisMap implements Map<String, String> {
     }
 
     private boolean isValidType(String key) {
-        String type = jedis.type(key);
-        return "none".equals(type) || "hash".equals(type);
+        try (Jedis jedis = POOL.getResource()) {
+            String type = jedis.type(key);
+            return "none".equals(type) || "hash".equals(type);
+        }
     }
 
     /* ---------------- Null conversion -------------- */
@@ -1138,6 +1325,11 @@ public class RedisMap implements Map<String, String> {
             RedisMap.this.removeField((String) nullToToken(entry.getKey()), null);
         }
 
+        //helper method used by Values removeAll and retainAll methods
+        protected String getCurrentKey() {
+            return current.getKey();
+        }
+
         private void processEntries(List<Entry<String, String>> entries) {
             entries.stream()
                     .filter(e -> !EMPTY_FIELD_TOKEN.equals(e.getKey()))
@@ -1169,7 +1361,7 @@ public class RedisMap implements Map<String, String> {
     }
 
     final class RedisIterator implements Iterator<List<Entry<String, String>>> {
-        private ScanParams scanParams;
+        private final ScanParams scanParams;
         private String cursor;
 
         public RedisIterator() {
@@ -1183,13 +1375,14 @@ public class RedisMap implements Map<String, String> {
 
         @Override
         public List<Entry<String, String>> next() {
-            if (cursor == null) {
-                cursor = "0";
+            try (Jedis jedis = POOL.getResource()) {
+                if (cursor == null) {
+                    cursor = "0";
+                }
+                ScanResult<Entry<String, String>> scanResult = jedis.hscan(redisKey, cursor, scanParams);
+                cursor = scanResult.getCursor();
+                return scanResult.getResult();
             }
-            ScanResult<Entry<String, String>> scanResult = jedis.hscan(redisKey, cursor, scanParams);
-            jedis.expire(redisKey, KEY_TTL);
-            cursor = scanResult.getCursor();
-            return scanResult.getResult();
         }
     }
 }

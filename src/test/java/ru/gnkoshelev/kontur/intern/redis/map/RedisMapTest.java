@@ -28,10 +28,13 @@ import static org.junit.Assert.assertTrue;
 
 public class RedisMapTest {
     static Jedis jedis;
+    static String keyPattern = "redis-map:";
+    static int ttl;
 
     @BeforeClass
     public static void setUp() {
         jedis = new Jedis();
+        ttl = new RedisMap().getTimeToLive();
         //jedis.flushAll();
     }
 
@@ -579,6 +582,24 @@ public class RedisMapTest {
     }
 
     @Test
+    public void testKeySet_RetainAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().keySet().retainAll(null);
+    }
+
+    @Test
+    public void testValues_RetainAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().values().retainAll(null);
+    }
+
+    @Test
+    public void testEntrySet_RetainAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().entrySet().retainAll(null);
+    }
+
+    @Test
     public void testKeySet_RemoveAll() {
         Map<String, String> map1 = new RedisMap();
         Map<String, String> map2 = new HashMap<>();
@@ -663,6 +684,24 @@ public class RedisMapTest {
     }
 
     @Test
+    public void testKeySet_RemoveAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().keySet().removeAll(null);
+    }
+
+    @Test
+    public void testValues_RemoveAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().values().removeAll(null);
+    }
+
+    @Test
+    public void testEntrySet_RemoveAll_NullArg() {
+        exceptionRule.expect(NullPointerException.class);
+        new RedisMap().entrySet().removeAll(null);
+    }
+
+    @Test
     public void testIterator_AddElements_SmallSet() {
         long id = 9825L;
         Map<String, String> map = new RedisMap(id);
@@ -679,7 +718,7 @@ public class RedisMapTest {
             keys.add(key);
             if ("key150".equals(key)) {
                 for (int i = 100; i < 1300; i++) {
-                    jedis.hset("redis-map:" + id, "key" + i, "value" + (i + 1));
+                    jedis.hset(keyPattern + id, "key" + i, "value" + (i + 1));
                 }
                 assertEquals(1300, map.size());
             }
@@ -705,7 +744,7 @@ public class RedisMapTest {
             keys.add(key);
             if ("key300".equals(key)) {
                 for (int i = 100; i < 2500; i++) {
-                    jedis.hset("redis-map:" + id, "key" + i, "value" + (i + 1));
+                    jedis.hset(keyPattern + id, "key" + i, "value" + (i + 1));
                 }
                 assertEquals(2500, map.size());
             }
@@ -731,7 +770,7 @@ public class RedisMapTest {
             keys.add(key);
             if ("key200".equals(key)) {
                 for (int i = 40; i < 360; i++) {
-                    jedis.hdel("redis-map:" + id, "key" + i);
+                    jedis.hdel(keyPattern + id, "key" + i);
                 }
                 assertEquals(80, map.size());
             }
@@ -756,7 +795,7 @@ public class RedisMapTest {
             keys.add(key);
             if ("key1000".equals(key)) {
                 for (int i = 200; i < 1800; i++) {
-                    jedis.hdel("redis-map:" + id, "key" + i);
+                    jedis.hdel(keyPattern + id, "key" + i);
                 }
                 assertEquals(400, map.size());
             }
@@ -1039,7 +1078,7 @@ public class RedisMapTest {
 
     @Test
     public void testConstructor_StringArg_NonExistingKey() {
-        String key = "redis-map:2567";
+        String key = keyPattern + 2567;
         assertFalse(jedis.exists(key));
 
         Map<String, String> map1 = new RedisMap(key);
@@ -1055,7 +1094,7 @@ public class RedisMapTest {
     @Test
     public void testConstructor_NumericArg_NonExistingKey() {
         long id = 1234L;
-        String key = String.format("redis-map:%d", id);
+        String key = keyPattern + id;
         assertFalse(jedis.exists(key));
 
         Map<String, String> map1 = new RedisMap(id);
@@ -1093,7 +1132,7 @@ public class RedisMapTest {
 
     @Test
     public void testConstructor_IllegalStringArg_Zero() {
-        String key = "redis-map:0";
+        String key = keyPattern + 0;
         exceptionRule.expect(IllegalArgumentException.class);
         exceptionRule.expectMessage("Illegal key: " + key);
         new RedisMap(key);
@@ -1101,7 +1140,7 @@ public class RedisMapTest {
 
     @Test
     public void testConstructor_IllegalStringArg_Max() {
-        String key = "redis-map:" + Long.MAX_VALUE;
+        String key = keyPattern + Long.MAX_VALUE;
         exceptionRule.expect(IllegalArgumentException.class);
         exceptionRule.expectMessage("Illegal key: " + key);
         new RedisMap(key);
@@ -1121,52 +1160,17 @@ public class RedisMapTest {
     }
 
     @Test
-    public void testMapExpire() throws InterruptedException {
+    public void testMapScheduler() throws InterruptedException {
         Map<String, String> map = new RedisMap();
         String key = ((RedisMap) map).getRedisKey();
-        int timeToLive = ((RedisMap) map).getTimeToLive();
-        int idleTime = timeToLive + 1;
-
-        map.put("key", "value");
-        assertFalse(map.isEmpty());
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertFalse(jedis.exists(key));
-        assertTrue(map.isEmpty());
-    }
-
-    @Test
-    public void testMapExpire_WithUpdates() throws InterruptedException {
-        Map<String, String> map = new RedisMap();
-        String key = ((RedisMap) map).getRedisKey();
-        int timeToLive = ((RedisMap) map).getTimeToLive();
-        int idleTime = timeToLive / 2 + 1;
-
-        map.put("key1", "value1");
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertEquals(1, map.size());
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertTrue(map.containsKey("key1"));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertTrue(map.containsValue("value1"));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertNull(map.put("key2", "value1"));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertEquals("value1", map.get("key1"));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertEquals("value1", map.remove("key1"));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        map.clear();
+        int idleTime = ttl * 2;
         assertTrue(jedis.exists(key));
 
-        TimeUnit.SECONDS.sleep(timeToLive + 1);
-        assertFalse(jedis.exists(key));
+        TimeUnit.SECONDS.sleep(idleTime);
+        assertTrue(jedis.exists(key));
+
+        map.clear();
+        TimeUnit.SECONDS.sleep(idleTime);
+        assertTrue(jedis.exists(key));
     }
 }
