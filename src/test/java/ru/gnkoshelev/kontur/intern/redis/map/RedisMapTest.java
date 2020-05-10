@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -29,12 +28,10 @@ import static org.junit.Assert.assertTrue;
 public class RedisMapTest {
     static Jedis jedis;
     static String keyPattern = "redis-map:";
-    static int ttl;
 
     @BeforeClass
     public static void setUp() {
         jedis = new Jedis();
-        ttl = new RedisMap().getTimeToLive();
         //jedis.flushAll();
     }
 
@@ -1157,20 +1154,5 @@ public class RedisMapTest {
         exceptionRule.expect(IllegalArgumentException.class);
         jedis.setex("key", 5, "value");
         new RedisMap("key");
-    }
-
-    @Test
-    public void testMapScheduler() throws InterruptedException {
-        Map<String, String> map = new RedisMap();
-        String key = ((RedisMap) map).getRedisKey();
-        int idleTime = ttl * 2;
-        assertTrue(jedis.exists(key));
-
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertTrue(jedis.exists(key));
-
-        map.clear();
-        TimeUnit.SECONDS.sleep(idleTime);
-        assertTrue(jedis.exists(key));
     }
 }
